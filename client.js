@@ -8,6 +8,7 @@ window.__ModuleLoader__.load({
     const TARGET = 'https://chat.deepseek.com/';
     const WORKSPACE_KEY = 'plugin:dsh-deepseek-web';
     const PANEL_ID = 'deepseek-web';
+    const SNAPSHOT_KEY = 'dsh-deepseek-web:snapshot:v1';
 
     const ZH = {
       'panel.label': 'DeepSeek 网页版',
@@ -48,7 +49,7 @@ window.__ModuleLoader__.load({
     };
 
     const CSS = [
-      '.dsw-root{display:flex;flex:1 1 auto;flex-direction:column;height:100%;min-height:0;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xs-13)}',
+      '.dsw-root{position:relative;display:flex;flex:1 1 auto;flex-direction:column;height:100%;min-height:0;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xs-13)}',
       '.dsw-toolbar{display:flex;flex:none;align-items:center;gap:8px;height:48px;padding:0 10px;border-bottom:.5px solid var(--dsw-alias-border-l1)}',
       '.dsw-brand{display:flex;flex-direction:column;min-width:0;line-height:1.2}',
       '.dsw-title{overflow:hidden;font-weight:600;white-space:nowrap;text-overflow:ellipsis}',
@@ -123,6 +124,60 @@ window.__ModuleLoader__.load({
 
     function externalIcon() {
       return icon(h('path', { d: 'M6.5 3.5h-3v9h9v-3M9 3h4v4M13 3 7.5 8.5' }));
+    }
+
+    const READ_STORAGE_SCRIPT = [
+      '(function () {',
+      '  var items = {};',
+      '  try {',
+      '    for (var i = 0; i < localStorage.length; i += 1) {',
+      '      var key = localStorage.key(i);',
+      '      if (key === null) continue;',
+      '      items[key] = localStorage.getItem(key) || "";',
+      '    }',
+      '  } catch (error) { return { error: String(error) }; }',
+      '  return { items: items };',
+      '})()',
+    ].join('\n');
+
+    function writeStorageScript(items) {
+      return [
+        '(function (items) {',
+        '  var written = 0;',
+        '  try {',
+        '    Object.keys(items).forEach(function (key) {',
+        '      localStorage.setItem(key, items[key]);',
+        '      written += 1;',
+        '    });',
+        '  } catch (error) { return { error: String(error), written: written }; }',
+        '  return { written: written };',
+        '})(',
+        JSON.stringify(items),
+        ')',
+      ].join('');
+    }
+
+    function loadSnapshot() {
+      try {
+        const raw = window.localStorage.getItem(SNAPSHOT_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || parsed.version !== 1 || typeof parsed.items !== 'object') return null;
+        return parsed;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function saveSnapshot(items) {
+      try {
+        window.localStorage.setItem(
+          SNAPSHOT_KEY,
+          JSON.stringify({ version: 1, savedAt: Date.now(), items: items })
+        );
+      } catch (error) {
+        // Quota exceeded: keep the previous snapshot rather than failing the panel.
+      }
     }
 
     function WhaleMark(props) {
@@ -217,6 +272,41 @@ window.__ModuleLoader__.load({
           setPhase('error');
         };
 
+        let restored = false;
+        let saving = false;
+        const snapshot = loadSnapshot();
+
+        const restore = () => {
+          if (restored || !snapshot || !snapshot.items) return Promise.resolve(false);
+          restored = true;
+          const items = snapshot.items;
+          if (typeof items.userToken !== 'string' || items.userToken === '') return Promise.resolve(false);
+          if (!guest) return Promise.resolve(false);
+          return guest
+            .executeJavaScript(writeStorageScript(items), false)
+            .then((result) => Boolean(result && result.written > 0))
+            .catch(() => false);
+        };
+
+        const persist = () => {
+          if (signal.aborted || !guest || saving) return;
+          saving = true;
+          guest
+            .executeJavaScript(READ_STORAGE_SCRIPT, false)
+            .then((result) => {
+              const items = result && result.items;
+              if (!items || typeof items.userToken !== 'string' || items.userToken === '') return;
+              saveSnapshot(items);
+            })
+            .catch(() => {})
+            .finally(() => {
+              saving = false;
+            });
+        };
+
+        const persistTimer = setInterval(persist, 20000);
+        signal.addEventListener('abort', () => clearInterval(persistTimer), { once: true });
+
         (async () => {
           try {
             const reservation = await browser.acquire(WORKSPACE_KEY);
@@ -269,6 +359,7 @@ window.__ModuleLoader__.load({
               () => {
                 if (signal.aborted) return;
                 setPhase((current) => (current === 'error' ? current : 'ready'));
+                setTimeout(persist, 1500);
               },
               { signal }
             );
@@ -277,6 +368,31 @@ window.__ModuleLoader__.load({
               (event) => {
                 if (!event.isMainFrame || event.errorCode === -3) return;
                 stop(event.errorDescription || 'ERR ' + event.errorCode);
+              },
+              { signal }
+            );
+
+            guest.addEventListener(
+              'did-finish-load',
+              () => {
+                if (signal.aborted) return;
+                restore().then((applied) => {
+                  if (!applied || signal.aborted) return;
+                  try {
+                    guest.reload();
+                  } catch (reason) {
+                    // The guest may already be torn down.
+                  }
+                });
+              },
+              { signal }
+            );
+
+            guest.addEventListener(
+              'did-navigate',
+              () => {
+                if (signal.aborted) return;
+                setTimeout(persist, 1200);
               },
               { signal }
             );

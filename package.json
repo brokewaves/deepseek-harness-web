@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepseek-web",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DeepSeek 网页版（chat.deepseek.com）的左侧栏入口与内嵌面板，适用于 DeepSeek Harness 桌面端。",
   "license": "MIT",
   "author": "周静远",
