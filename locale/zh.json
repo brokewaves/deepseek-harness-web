@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DeepSeek 网页版",
+    "description": "在左侧栏加入一个 DeepSeek 入口：内嵌打开 chat.deepseek.com，登录后即可使用网页版对话。"
+  }
+}

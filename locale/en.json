@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DeepSeek Web",
+    "description": "Adds a sidebar entry that opens chat.deepseek.com inside DSH with the embedded browser."
+  }
+}
