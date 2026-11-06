@@ -19,6 +19,7 @@ window.__ModuleLoader__.load({
       'panel.retry': '重试',
       'status.starting': '正在连接',
       'status.loading': '加载中',
+      'status.restoring': '正在恢复登录',
       'status.ready': '已就绪',
       'status.error': '加载失败',
       'status.unsupported': '仅桌面版',
@@ -38,6 +39,7 @@ window.__ModuleLoader__.load({
       'panel.retry': 'Retry',
       'status.starting': 'Connecting',
       'status.loading': 'Loading',
+      'status.restoring': 'Restoring sign-in',
       'status.ready': 'Ready',
       'status.error': 'Failed',
       'status.unsupported': 'Desktop only',
@@ -56,7 +58,7 @@ window.__ModuleLoader__.load({
       '.dsw-sub{font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-secondary)}',
       '.dsw-status{display:inline-flex;flex:none;align-items:center;gap:5px;margin-left:6px;font:var(--dsw-font-xxxs-11);color:var(--dsw-alias-label-secondary)}',
       '.dsw-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-idle-primary)}',
-      '.dsw-status[data-phase=loading] .dsw-dot,.dsw-status[data-phase=starting] .dsw-dot{background:var(--dsw-alias-state-warn-primary)}',
+      '.dsw-status[data-phase=loading] .dsw-dot,.dsw-status[data-phase=starting] .dsw-dot,.dsw-status[data-phase=restoring] .dsw-dot{background:var(--dsw-alias-state-warn-primary)}',
       '.dsw-status[data-phase=ready] .dsw-dot{background:var(--dsw-alias-state-success-primary)}',
       '.dsw-status[data-phase=error] .dsw-dot{background:var(--dsw-alias-state-error-primary)}',
       '.dsw-spacer{flex:auto}',
@@ -65,7 +67,11 @@ window.__ModuleLoader__.load({
       '.dsw-body{position:relative;display:flex;flex:auto;min-width:0;min-height:0}',
       '.dsw-host{display:flex;flex:auto;min-width:0;min-height:0}',
       '.dsw-host[hidden]{display:none}',
+      '.dsw-host[data-veiled=true] .dsw-webview{visibility:hidden}',
       '.dsw-webview{display:flex;flex:auto;width:100%;height:100%;min-width:0;min-height:0;border:0;background:var(--dsw-alias-bg-base);-webkit-app-region:no-drag}',
+      '.dsw-veil{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);font:var(--dsw-font-xs-13)}',
+      '.dsw-spin{width:16px;height:16px;border:1.5px solid var(--dsw-alias-border-l2);border-top-color:var(--dsw-alias-brand-primary);border-radius:50%;animation:dsw-spin .8s linear infinite}',
+      '@keyframes dsw-spin{to{transform:rotate(360deg)}}',
       '.dsw-note{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;max-width:460px;margin:auto;padding:32px;text-align:center}',
       '.dsw-note h3{margin:0;font:var(--dsw-font-xs-13);font-weight:600}',
       '.dsw-note p{margin:0;font:var(--dsw-font-xs-13);line-height:1.6;color:var(--dsw-alias-label-secondary)}',
@@ -137,6 +143,17 @@ window.__ModuleLoader__.load({
       '    }',
       '  } catch (error) { return { error: String(error) }; }',
       '  return { items: items };',
+      '})()',
+    ].join('\n');
+
+    const SIGNED_IN_SCRIPT = [
+      '(function () {',
+      '  try {',
+      '    var token = localStorage.getItem("userToken");',
+      '    if (!token) return "signed-out";',
+      '    if (document.querySelector(\'input[type="password"]\')) return "signed-out";',
+      '    return "signed-in";',
+      '  } catch (error) { return "unknown"; }',
       '})()',
     ].join('\n');
 
@@ -274,18 +291,68 @@ window.__ModuleLoader__.load({
 
         let restored = false;
         let saving = false;
+        let restoreGuard;
         const snapshot = loadSnapshot();
+        const savedItems = snapshot && snapshot.items ? snapshot.items : null;
+        const hasSnapshot = Boolean(
+          savedItems && typeof savedItems.userToken === 'string' && savedItems.userToken !== ''
+        );
+        let veiled = hasSnapshot;
 
         const restore = () => {
-          if (restored || !snapshot || !snapshot.items) return Promise.resolve(false);
+          if (restored || !hasSnapshot || !guest) return Promise.resolve(false);
           restored = true;
-          const items = snapshot.items;
-          if (typeof items.userToken !== 'string' || items.userToken === '') return Promise.resolve(false);
-          if (!guest) return Promise.resolve(false);
           return guest
-            .executeJavaScript(writeStorageScript(items), false)
+            .executeJavaScript(writeStorageScript(savedItems), false)
             .then((result) => Boolean(result && result.written > 0))
             .catch(() => false);
+        };
+
+        // The reload boots the app with the token in place, but the signed-out
+        // shell can still paint before the client-side router settles. Keep the
+        // veil until the guest reports an actual signed-in document.
+        const liftVeilWhenReady = () => {
+          let tries = 0;
+          let signedOut = 0;
+          const reveal = () => {
+            veiled = false;
+            setPhase((current) => (current === 'error' ? current : 'ready'));
+          };
+          const tick = () => {
+            if (signal.aborted || !guest) return;
+            guest
+              .executeJavaScript(SIGNED_IN_SCRIPT, false)
+              .then((state) => {
+                if (signal.aborted) return;
+                if (state === 'signed-in') {
+                  reveal();
+                  return;
+                }
+                if (state === 'signed-out') {
+                  signedOut += 1;
+                  if (signedOut >= 12) {
+                    reveal();
+                    return;
+                  }
+                }
+                tries += 1;
+                if (tries >= 48) {
+                  reveal();
+                  return;
+                }
+                setTimeout(tick, 250);
+              })
+              .catch(() => {
+                if (signal.aborted) return;
+                tries += 1;
+                if (tries >= 48) {
+                  reveal();
+                  return;
+                }
+                setTimeout(tick, 250);
+              });
+          };
+          setTimeout(tick, 200);
         };
 
         const persist = () => {
@@ -333,15 +400,44 @@ window.__ModuleLoader__.load({
             guest.addEventListener(
               'dom-ready',
               () => {
-                if (signal.aborted || started) return;
-                started = true;
-                setPhase('loading');
-                guest.loadURL(TARGET).catch((reason) => {
+                if (signal.aborted) return;
+                if (!started) {
+                  started = true;
+                  setPhase(hasSnapshot ? 'restoring' : 'loading');
+                  guest.loadURL(TARGET).catch((reason) => {
+                    if (signal.aborted) return;
+                    // Chromium aborts the pending about:blank navigation when the
+                    // real one starts; the real page usually keeps loading.
+                    if (isAborted(reason)) return;
+                    stop(reason);
+                  });
+                  if (hasSnapshot) {
+                    restoreGuard = setTimeout(() => {
+                      if (signal.aborted) return;
+                      veiled = false;
+                      setPhase((current) => (current === 'restoring' ? 'ready' : current));
+                    }, 12000);
+                  }
+                  return;
+                }
+                // The real document is ready: write the saved session in before
+                // the page can paint its signed-out surface, then reload once so
+                // the app boots with the token already in place.
+                if (!hasSnapshot || restored) return;
+                restore().then((applied) => {
                   if (signal.aborted) return;
-                  // Chromium aborts the pending about:blank navigation when the
-                  // real one starts; the real page usually keeps loading.
-                  if (isAborted(reason)) return;
-                  stop(reason);
+                  if (!applied) {
+                    veiled = false;
+                    setPhase((current) => (current === 'error' ? current : 'ready'));
+                    return;
+                  }
+                  try {
+                    guest.reload();
+                    liftVeilWhenReady();
+                  } catch (error) {
+                    veiled = false;
+                    setPhase((current) => (current === 'error' ? current : 'ready'));
+                  }
                 });
               },
               { signal }
@@ -350,7 +446,9 @@ window.__ModuleLoader__.load({
               'did-start-loading',
               () => {
                 if (signal.aborted) return;
-                setPhase((current) => (current === 'error' ? current : 'loading'));
+                setPhase((current) =>
+                  current === 'error' || current === 'restoring' ? current : 'loading'
+                );
               },
               { signal }
             );
@@ -358,7 +456,9 @@ window.__ModuleLoader__.load({
               'did-stop-loading',
               () => {
                 if (signal.aborted) return;
-                setPhase((current) => (current === 'error' ? current : 'ready'));
+                if (!veiled) {
+                  setPhase((current) => (current === 'error' ? current : 'ready'));
+                }
                 setTimeout(persist, 1500);
               },
               { signal }
@@ -376,14 +476,9 @@ window.__ModuleLoader__.load({
               'did-finish-load',
               () => {
                 if (signal.aborted) return;
-                restore().then((applied) => {
-                  if (!applied || signal.aborted) return;
-                  try {
-                    guest.reload();
-                  } catch (reason) {
-                    // The guest may already be torn down.
-                  }
-                });
+                if (!veiled) {
+                  setPhase((current) => (current === 'error' ? current : 'ready'));
+                }
               },
               { signal }
             );
@@ -406,6 +501,7 @@ window.__ModuleLoader__.load({
 
         return () => {
           controller.abort();
+          clearTimeout(restoreGuard);
           const current = viewRef.current;
           viewRef.current = null;
           if (current && current.parentNode) current.parentNode.removeChild(current);
@@ -418,6 +514,7 @@ window.__ModuleLoader__.load({
       };
 
       const reload = () => {
+        if (phase === 'restoring') return;
         const current = viewRef.current;
         if (!current || phase === 'error' || phase === 'unsupported') {
           setFailure('');
@@ -467,7 +564,21 @@ window.__ModuleLoader__.load({
         body = h(
           'div',
           { className: 'dsw-body' },
-          h('div', { className: 'dsw-host', ref: hostRef, hidden: phase === 'error' }),
+          h('div', {
+            className: 'dsw-host',
+            ref: hostRef,
+            hidden: phase === 'error',
+            'data-veiled': phase === 'restoring',
+          }),
+          phase === 'restoring'
+            ? h(
+                'div',
+                { className: 'dsw-veil' },
+                h(WhaleMark, { size: 34 }),
+                h('div', { className: 'dsw-spin' }),
+                h('span', null, t('status.restoring'))
+              )
+            : null,
           phase === 'error'
             ? h(
                 'div',
@@ -498,7 +609,14 @@ window.__ModuleLoader__.load({
           h('span', { className: 'dsw-spacer' }),
           h(
             'button',
-            { type: 'button', className: 'dsw-btn', title: t('panel.reload'), 'aria-label': t('panel.reload'), onClick: reload },
+            {
+              type: 'button',
+              className: 'dsw-btn',
+              title: t('panel.reload'),
+              'aria-label': t('panel.reload'),
+              disabled: phase === 'restoring',
+              onClick: reload,
+            },
             reloadIcon()
           ),
           h(
