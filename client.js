@@ -17,6 +17,7 @@ window.__ModuleLoader__.load({
       'panel.reload': '刷新',
       'panel.openExternal': '在浏览器中打开',
       'panel.retry': '重试',
+      'panel.back': '返回对话',
       'status.starting': '正在连接',
       'status.loading': '加载中',
       'status.restoring': '正在恢复登录',
@@ -37,6 +38,7 @@ window.__ModuleLoader__.load({
       'panel.reload': 'Reload',
       'panel.openExternal': 'Open in browser',
       'panel.retry': 'Retry',
+      'panel.back': 'Back to chat',
       'status.starting': 'Connecting',
       'status.loading': 'Loading',
       'status.restoring': 'Restoring sign-in',
@@ -51,7 +53,8 @@ window.__ModuleLoader__.load({
     };
 
     const CSS = [
-      '.dsw-root{position:relative;display:flex;flex:1 1 auto;flex-direction:column;height:100%;min-height:0;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xs-13)}',
+      '.dsw-root{position:fixed;top:0;right:0;bottom:0;left:0;z-index:2147483000;display:flex;flex-direction:column;min-height:0;overflow:hidden;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-primary);font:var(--dsw-font-xs-13);-webkit-app-region:no-drag}',
+      '[data-windows-titlebar] .dsw-root{top:var(--dsh-windows-titlebar-height,40px)}',
       '.dsw-toolbar{display:flex;flex:none;align-items:center;gap:8px;height:48px;padding:0 10px;border-bottom:.5px solid var(--dsw-alias-border-l1)}',
       '.dsw-brand{display:flex;flex-direction:column;min-width:0;line-height:1.2}',
       '.dsw-title{overflow:hidden;font-weight:600;white-space:nowrap;text-overflow:ellipsis}',
@@ -130,6 +133,10 @@ window.__ModuleLoader__.load({
 
     function externalIcon() {
       return icon(h('path', { d: 'M6.5 3.5h-3v9h9v-3M9 3h4v4M13 3 7.5 8.5' }));
+    }
+
+    function backIcon() {
+      return icon(h('path', { d: 'M10 3 5 8l5 5M5 8h8' }));
     }
 
     const READ_STORAGE_SCRIPT = [
@@ -263,6 +270,19 @@ window.__ModuleLoader__.load({
     function DeepSeekPanel() {
       const ctx = activeContext;
       const t = useTranslator(ctx);
+
+      // shell.overlay 的容器 z-index 只有 20，drawer 模式下的侧栏是 z-index 71，
+      // 面板盖不过去；面板激活期间直接把侧栏收起来，卸载时原样恢复。
+      React.useEffect(() => {
+        const sidebar = document.querySelector('[class*="sidebarCol"]');
+        if (sidebar === null) return undefined;
+        const previous = sidebar.style.display;
+        sidebar.style.display = 'none';
+        return () => {
+          sidebar.style.display = previous;
+        };
+      }, []);
+
       const hostRef = React.useRef(null);
       const viewRef = React.useRef(null);
       const [phase, setPhase] = React.useState('starting');
@@ -592,12 +612,42 @@ window.__ModuleLoader__.load({
         );
       }
 
-      return h(
+      const titlebarOffset = typeof document !== 'undefined' && document.documentElement.dataset.windowsTitlebar !== undefined ? 40 : 0;
+      const rootStyle = {
+        position: 'fixed',
+        top: titlebarOffset,
+        right: 0,
+        bottom: 0,
+        left: 0,
+        zIndex: 2147483000,
+        display: 'flex',
+        flexDirection: 'column',
+        minHeight: 0,
+        overflow: 'hidden',
+        pointerEvents: 'auto',
+        background: 'var(--dsw-alias-bg-base, #15161a)',
+        color: 'var(--dsw-alias-label-primary)',
+      };
+
+      const root = h(
         'div',
-        { className: 'dsw-root' },
+        { className: 'dsw-root', style: rootStyle },
         h(
           'div',
           { className: 'dsw-toolbar' },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dsw-btn',
+              title: t('panel.back'),
+              'aria-label': t('panel.back'),
+              onClick: () => {
+                if (ctx.layout) ctx.layout.selectPanel(null);
+              },
+            },
+            backIcon()
+          ),
           h(WhaleMark, { size: 26 }),
           h(
             'div',
@@ -633,10 +683,25 @@ window.__ModuleLoader__.load({
         ),
         body
       );
+      return root;
+    }
+
+    // The frame-wide overlay layer sits above every column, so the panel covers
+    // the sidebar without fighting its stacking context. The main panel cell
+    // stays registered (the sidebar entry selects it) but renders nothing.
+    function DeepSeekOverlay(props) {
+      const readPanelId = props.usePanelInfo;
+      const activePanelId = typeof readPanelId === 'function' ? readPanelId((snapshot) => snapshot.activePanelId) : undefined;
+      if (activePanelId !== PANEL_ID) return null;
+      return h(DeepSeekPanel);
+    }
+
+    function DeepSeekPanelPlaceholder() {
+      return h('div', { className: 'dsw-placeholder' });
     }
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots', 'locale', 'layout'],
       apply(ctx) {
         activeContext = ctx;
 
@@ -674,7 +739,18 @@ window.__ModuleLoader__.load({
               key: PANEL_ID,
               locale: NS,
             },
-            DeepSeekPanel
+            DeepSeekPanelPlaceholder
+          )
+        );
+
+        ctx.slots.inject('shell.overlay', () =>
+          ctx.slots.register(
+            {
+              name: 'shell.overlay',
+              id: `${PANEL_ID}-overlay`,
+              order: 0,
+            },
+            DeepSeekOverlay
           )
         );
       },
